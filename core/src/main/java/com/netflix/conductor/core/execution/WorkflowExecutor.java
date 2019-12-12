@@ -1209,6 +1209,12 @@ public class WorkflowExecutor {
             switch (task.getStatus()) {
                 case SCHEDULED:
                     systemTask.start(workflow, task, this);
+                    // Persist Subworkflow task input as TaskResult skips it, and Rerun or similar use cases might lookup for
+                    // SubworkflowId in input.
+                    // TODO Revisit Subworkflow task & Subworkflow wiring.
+                    if (task.getTaskType().equalsIgnoreCase(SubWorkflow.NAME)) {
+                        executionDAOFacade.updateTask(task);
+                    }
                     break;
 
                 case IN_PROGRESS:
@@ -1459,6 +1465,7 @@ public class WorkflowExecutor {
             } else {
                 // If not found look into sub workflows
                 if (task.getTaskType().equalsIgnoreCase(SubWorkflow.NAME)) {
+//                    String subWorkflowId = task.getOutputData().get(SUB_WORKFLOW_ID).toString();
                     String subWorkflowId = task.getInputData().get(SUB_WORKFLOW_ID).toString();
                     if (rerunWF(subWorkflowId, taskId, taskInput, null, null)) {
                         rerunFromTask = task;
