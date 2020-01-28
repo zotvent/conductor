@@ -131,7 +131,7 @@ public class SubWorkflow extends WorkflowSystemTask {
 
 	@Override
 	public boolean isAsync() {
-		return false;
+		return true;
 	}
 
 	private String getSubWorkflowId(Task task) {
