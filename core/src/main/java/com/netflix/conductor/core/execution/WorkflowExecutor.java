@@ -24,7 +24,6 @@ import static com.netflix.conductor.common.metadata.workflow.TaskType.TERMINATE;
 import static com.netflix.conductor.core.execution.ApplicationException.Code.CONFLICT;
 import static com.netflix.conductor.core.execution.ApplicationException.Code.INVALID_INPUT;
 import static com.netflix.conductor.core.execution.ApplicationException.Code.NOT_FOUND;
-import static com.netflix.conductor.core.execution.tasks.SubWorkflow.SUB_WORKFLOW_ID;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
@@ -89,6 +88,7 @@ public class WorkflowExecutor {
     private WorkflowStatusListener workflowStatusListener;
 
     private int activeWorkerLastPollInSecs;
+    private int queueTaskMessagePostponeSeconds;
     public static final String DECIDER_QUEUE = "_deciderQueue";
     private static final String className = WorkflowExecutor.class.getSimpleName();
     private final ExecutionLockService executionLockService;
@@ -111,6 +111,7 @@ public class WorkflowExecutor {
         this.metadataMapperService = metadataMapperService;
         this.executionDAOFacade = executionDAOFacade;
         this.activeWorkerLastPollInSecs = config.getIntProperty("tasks.active.worker.lastpoll", 10);
+        this.queueTaskMessagePostponeSeconds = config.getIntProperty("task.queue.message.postponeSeconds", 60);
         this.workflowStatusListener = workflowStatusListener;
         this.executionLockService = executionLockService;
     }
@@ -436,7 +437,7 @@ public class WorkflowExecutor {
         // Get tasks that have callbackAfterSeconds > 0 and set the callbackAfterSeconds to 0
         for (Task task : workflow.getTasks()) {
             if (task.getCallbackAfterSeconds() > 0) {
-                if (queueDAO.setOffsetTime(QueueUtils.getQueueName(task), task.getTaskId(), 0)) {
+                if (queueDAO.resetOffsetTime(QueueUtils.getQueueName(task), task.getTaskId())) {
                     task.setCallbackAfterSeconds(0);
                     executionDAOFacade.updateTask(task);
                 }
@@ -635,7 +636,7 @@ public class WorkflowExecutor {
         LOGGER.debug("Completed workflow execution for {}", workflow.getWorkflowId());
 
         // If the following task, for some reason fails, the sweep will take care of this again!
-        if (workflow.getParentWorkflowId() != null) {
+        if (StringUtils.isNotEmpty(workflow.getParentWorkflowId())) {
             Workflow parent = executionDAOFacade.getWorkflowById(workflow.getParentWorkflowId(), false);
             WorkflowDef parentDef = Optional.ofNullable(parent.getWorkflowDefinition())
                     .orElseGet(() -> metadataDAO.getWorkflowDef(parent.getWorkflowName(), parent.getWorkflowVersion())
@@ -824,6 +825,7 @@ public class WorkflowExecutor {
         task.setWorkerId(taskResult.getWorkerId());
         task.setCallbackAfterSeconds(taskResult.getCallbackAfterSeconds());
         task.setOutputData(taskResult.getOutputData());
+        task.setSubWorkflowId(taskResult.getSubWorkflowId());
 
         if (task.getOutputData() != null) {
             deciderService.externalizeTaskData(task);
@@ -859,12 +861,10 @@ public class WorkflowExecutor {
                         break;
                     case IN_PROGRESS:
                     case SCHEDULED:
-                        // put it back in queue based on callbackAfterSeconds
+                        // postpone based on callbackAfterSeconds
                         long callBack = taskResult.getCallbackAfterSeconds();
-                        queueDAO.remove(taskQueueName, task.getTaskId());
-                        LOGGER.debug("Task: {} removed from taskQueue: {} since the task status is {}", task, taskQueueName, task.getStatus().name());
-                        queueDAO.push(taskQueueName, task.getTaskId(), task.getWorkflowPriority(), callBack); // Milliseconds
-                        LOGGER.debug("Task: {} pushed back to taskQueue: {} since the task status is {} with callbackAfterSeconds: {}", task, taskQueueName, task.getStatus().name(), callBack);
+                        queueDAO.postpone(taskQueueName, task.getTaskId(), task.getWorkflowPriority(), callBack);
+                        LOGGER.debug("Task: {} postponed in taskQueue: {} since the task status is {} with callbackAfterSeconds: {}", task, taskQueueName, task.getStatus().name(), callBack);
                         break;
                     default:
                         break;
@@ -1152,10 +1152,11 @@ public class WorkflowExecutor {
                 return;
             }
             LOGGER.debug("Task: {} fetched from execution DAO for taskId: {}", task, taskId);
+            String queueName = QueueUtils.getQueueName(task);
             if (task.getStatus().isTerminal()) {
                 //Tune the SystemTaskWorkerCoordinator's queues - if the queue size is very big this can happen!
                 LOGGER.info("Task {}/{} was already completed.", task.getTaskType(), task.getTaskId());
-                queueDAO.remove(QueueUtils.getQueueName(task), task.getTaskId());
+                queueDAO.remove(queueName, task.getTaskId());
                 return;
             }
 
@@ -1173,7 +1174,7 @@ public class WorkflowExecutor {
                     task.setStatus(CANCELED);
                 }
                 executionDAOFacade.updateTask(task);
-                queueDAO.remove(QueueUtils.getQueueName(task), task.getTaskId());
+                queueDAO.remove(queueName, task.getTaskId());
                 return;
             }
 
@@ -1181,10 +1182,14 @@ public class WorkflowExecutor {
                 if (executionDAOFacade.exceedsInProgressLimit(task)) {
                     //to do add a metric to record this
                     LOGGER.warn("Concurrent Execution limited for {}:{}", taskId, task.getTaskDefName());
+                    // Postpone a message, so that it would be available for poll again.
+                    queueDAO.postpone(queueName, taskId, task.getWorkflowPriority(), queueTaskMessagePostponeSeconds);
                     return;
                 }
                 if (task.getRateLimitPerFrequency() > 0 && executionDAOFacade.exceedsRateLimitPerFrequency(task, metadataDAO.getTaskDef(task.getTaskDefName()))) {
                     LOGGER.warn("RateLimit Execution limited for {}:{}, limit:{}", taskId, task.getTaskDefName(), task.getRateLimitPerFrequency());
+                    // Postpone a message, so that it would be available for poll again.
+                    queueDAO.postpone(queueName, taskId, task.getWorkflowPriority(), queueTaskMessagePostponeSeconds);
                     return;
                 }
             }
@@ -1385,7 +1390,7 @@ public class WorkflowExecutor {
             createdTasks.forEach(task -> new RetryUtil<>().retryOnException(() ->
             {
                 if (task.getTaskType().equals(SUB_WORKFLOW.name())) {
-                    executionDAOFacade.removeWorkflow((String) task.getOutputData().get(SUB_WORKFLOW_ID), false);
+                    executionDAOFacade.removeWorkflow(task.getSubWorkflowId(), false);
                 }
                 executionDAOFacade.removeTask(task.getTaskId());
                 return null;
@@ -1456,7 +1461,7 @@ public class WorkflowExecutor {
             } else {
                 // If not found look into sub workflows
                 if (task.getTaskType().equalsIgnoreCase(SubWorkflow.NAME)) {
-                    String subWorkflowId = task.getInputData().get(SUB_WORKFLOW_ID).toString();
+                    String subWorkflowId = task.getSubWorkflowId();
                     if (rerunWF(subWorkflowId, taskId, taskInput, null, null)) {
                         rerunFromTask = task;
                         break;
